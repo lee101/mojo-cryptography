@@ -2,6 +2,9 @@
 
 from std.algorithm import parallelize
 from std.bit import bit_reverse, byte_swap
+from std.gpu import global_idx
+from std.gpu.host import DeviceContext
+from std.math import iota
 from std.sys.info import simd_width_of
 from std.sys.intrinsics import llvm_intrinsic
 
@@ -22,26 +25,16 @@ def rotr64(x: UInt64, n: UInt64) -> UInt64:
 
 @always_inline
 def load_be32(data: UnsafePointer[UInt8, _], i: Int) -> UInt32:
-    return (
-        (UInt32(data[i]) << 24)
-        | (UInt32(data[i + 1]) << 16)
-        | (UInt32(data[i + 2]) << 8)
-        | UInt32(data[i + 3])
-    )
+    return byte_swap(
+        (data + i).bitcast[UInt32]().load[width=1, alignment=1]()
+    )[0]
 
 
 @always_inline
 def load_be64(data: UnsafePointer[UInt8, _], i: Int) -> UInt64:
-    return (
-        (UInt64(data[i]) << 56)
-        | (UInt64(data[i + 1]) << 48)
-        | (UInt64(data[i + 2]) << 40)
-        | (UInt64(data[i + 3]) << 32)
-        | (UInt64(data[i + 4]) << 24)
-        | (UInt64(data[i + 5]) << 16)
-        | (UInt64(data[i + 6]) << 8)
-        | UInt64(data[i + 7])
-    )
+    return byte_swap(
+        (data + i).bitcast[UInt64]().load[width=1, alignment=1]()
+    )[0]
 
 
 @always_inline
@@ -104,6 +97,7 @@ def xor_bytes[dst_origin: MutOrigin](
         i += 1
 
 
+@always_inline
 def sha256_k(i: Int) -> UInt32:
     var k: InlineArray[UInt32, 64] = [
         0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5,
@@ -146,7 +140,7 @@ def sha256_compress[state_origin: MutOrigin](
     while i < 16:
         w[i] = load_be32(data, offset + i * 4)
         i += 1
-    for i in range(16, 64):
+    comptime for i in range(16, 64):
         var a = w[i - 15]
         var b = w[i - 2]
         var s0 = rotr32(a, 7) ^ rotr32(a, 18) ^ (a >> 3)
@@ -160,7 +154,7 @@ def sha256_compress[state_origin: MutOrigin](
     var f = state[5]
     var g = state[6]
     var h = state[7]
-    for i in range(64):
+    comptime for i in range(64):
         var s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
         var ch = (e & f) ^ ((~e) & g)
         var t1 = h + s1 + ch + sha256_k(i) + w[i]
@@ -248,6 +242,7 @@ def sha256_hash[dst_origin: MutOrigin](
     sha256_finish(data, n, state.unsafe_ptr(), 0, dst, 7 if variant == 224 else 8)
 
 
+@always_inline
 def sha512_k(i: Int) -> UInt64:
     var k: InlineArray[UInt64, 80] = [
         0x428A2F98D728AE22, 0x7137449123EF65CD, 0xB5C0FBCFEC4D3B2F,
@@ -301,7 +296,7 @@ def sha512_compress[state_origin: MutOrigin](
     while i < 16:
         w[i] = load_be64(data, offset + i * 8)
         i += 1
-    for i in range(16, 80):
+    comptime for i in range(16, 80):
         var a = w[i - 15]
         var b = w[i - 2]
         var s0 = rotr64(a, 1) ^ rotr64(a, 8) ^ (a >> 7)
@@ -315,7 +310,7 @@ def sha512_compress[state_origin: MutOrigin](
     var f = state[5]
     var g = state[6]
     var h = state[7]
-    for i in range(80):
+    comptime for i in range(80):
         var s1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
         var ch = (e & f) ^ ((~e) & g)
         var t1 = h + s1 + ch + sha512_k(i) + w[i]
@@ -1086,20 +1081,65 @@ def aes_encrypt_block(
 
 
 @always_inline
-def ghash_multiply(
-    state: U64Ptr,
-    h_hi: UInt64,
-    h_lo: UInt64,
+def aes_encrypt_four_blocks(
+    source: UnsafePointer[UInt8, _],
+    destination: BPtr,
+    expanded: BPtr,
+    rounds: Int,
 ):
     comptime Block = SIMD[DType.uint64, 2]
-    var left = Block(
-        bit_reverse(state[0]),
-        bit_reverse(state[1]),
-    )
-    var right = Block(
-        bit_reverse(h_hi),
-        bit_reverse(h_lo),
-    )
+    var source_words = source.bitcast[UInt64]()
+    var destination_words = destination.bitcast[UInt64]()
+    var key_words = expanded.bitcast[UInt64]()
+    var first_key = key_words.load[width=2, alignment=1]()
+    var s0 = source_words.load[width=2, alignment=1](0) ^ first_key
+    var s1 = source_words.load[width=2, alignment=1](2) ^ first_key
+    var s2 = source_words.load[width=2, alignment=1](4) ^ first_key
+    var s3 = source_words.load[width=2, alignment=1](6) ^ first_key
+    for round_index in range(1, rounds):
+        var round_key = key_words.load[width=2, alignment=1](
+            round_index * 2
+        )
+        s0 = llvm_intrinsic[
+            "llvm.x86.aesni.aesenc", Block, Block, Block
+        ](s0, round_key)
+        s1 = llvm_intrinsic[
+            "llvm.x86.aesni.aesenc", Block, Block, Block
+        ](s1, round_key)
+        s2 = llvm_intrinsic[
+            "llvm.x86.aesni.aesenc", Block, Block, Block
+        ](s2, round_key)
+        s3 = llvm_intrinsic[
+            "llvm.x86.aesni.aesenc", Block, Block, Block
+        ](s3, round_key)
+    var last_key = key_words.load[width=2, alignment=1](rounds * 2)
+    s0 = llvm_intrinsic[
+        "llvm.x86.aesni.aesenclast", Block, Block, Block
+    ](s0, last_key)
+    s1 = llvm_intrinsic[
+        "llvm.x86.aesni.aesenclast", Block, Block, Block
+    ](s1, last_key)
+    s2 = llvm_intrinsic[
+        "llvm.x86.aesni.aesenclast", Block, Block, Block
+    ](s2, last_key)
+    s3 = llvm_intrinsic[
+        "llvm.x86.aesni.aesenclast", Block, Block, Block
+    ](s3, last_key)
+    destination_words.store[alignment=1](0, s0)
+    destination_words.store[alignment=1](2, s1)
+    destination_words.store[alignment=1](4, s2)
+    destination_words.store[alignment=1](6, s3)
+
+
+@always_inline
+def ghash_multiply(
+    state: U64Ptr,
+    h_reversed_hi: UInt64,
+    h_reversed_lo: UInt64,
+):
+    comptime Block = SIMD[DType.uint64, 2]
+    var left = Block(state[0], state[1])
+    var right = Block(h_reversed_hi, h_reversed_lo)
     var p0 = llvm_intrinsic[
         "llvm.x86.pclmulqdq", Block, Block, Block, UInt8
     ](left, right, 0x00)
@@ -1132,32 +1172,32 @@ def ghash_multiply(
         ^ (overflow << 2)
         ^ (overflow << 7)
     )
-    state[0] = bit_reverse(r0)
-    state[1] = bit_reverse(r1)
+    state[0] = r0
+    state[1] = r1
 
 
 def ghash_block(
     state: U64Ptr,
-    h_hi: UInt64,
-    h_lo: UInt64,
+    h_reversed_hi: UInt64,
+    h_reversed_lo: UInt64,
     data: UnsafePointer[UInt8, _],
     n: Int,
 ):
     if n == 16:
-        state[0] ^= load_be64(data, 0)
-        state[1] ^= load_be64(data, 8)
+        state[0] ^= bit_reverse(load_be64(data, 0))
+        state[1] ^= bit_reverse(load_be64(data, 8))
     else:
         var block = InlineArray[UInt8, 16](fill=0)
         copy_bytes(block.unsafe_ptr(), data, n)
-        state[0] ^= load_be64(block.unsafe_ptr(), 0)
-        state[1] ^= load_be64(block.unsafe_ptr(), 8)
-    ghash_multiply(state, h_hi, h_lo)
+        state[0] ^= bit_reverse(load_be64(block.unsafe_ptr(), 0))
+        state[1] ^= bit_reverse(load_be64(block.unsafe_ptr(), 8))
+    ghash_multiply(state, h_reversed_hi, h_reversed_lo)
 
 
 def ghash_update(
     state: U64Ptr,
-    h_hi: UInt64,
-    h_lo: UInt64,
+    h_reversed_hi: UInt64,
+    h_reversed_lo: UInt64,
     data: UnsafePointer[UInt8, _],
     n: Int,
 ):
@@ -1166,7 +1206,13 @@ def ghash_update(
         var count = 16
         if count > n - offset:
             count = n - offset
-        ghash_block(state, h_hi, h_lo, data + offset, count)
+        ghash_block(
+            state,
+            h_reversed_hi,
+            h_reversed_lo,
+            data + offset,
+            count,
+        )
         offset += count
 
 
@@ -1180,22 +1226,26 @@ def ghash_all(
 ):
     var state = InlineArray[UInt64, 2](fill=0)
     var state_ptr = U64Ptr(unsafe_from_address=Int(state.unsafe_ptr()))
-    var h_hi = load_be64(h, 0)
-    var h_lo = load_be64(h, 8)
-    ghash_update(state_ptr, h_hi, h_lo, aad, aad_len)
-    ghash_update(state_ptr, h_hi, h_lo, data, data_len)
+    var h_reversed_hi = bit_reverse(load_be64(h, 0))
+    var h_reversed_lo = bit_reverse(load_be64(h, 8))
+    ghash_update(
+        state_ptr, h_reversed_hi, h_reversed_lo, aad, aad_len
+    )
+    ghash_update(
+        state_ptr, h_reversed_hi, h_reversed_lo, data, data_len
+    )
     var lengths = InlineArray[UInt8, 16](fill=0)
     store_be64(lengths.unsafe_ptr(), 0, UInt64(aad_len) * 8)
     store_be64(lengths.unsafe_ptr(), 8, UInt64(data_len) * 8)
     ghash_block(
         state_ptr,
-        h_hi,
-        h_lo,
+        h_reversed_hi,
+        h_reversed_lo,
         lengths.unsafe_ptr(),
         16,
     )
-    store_be64(destination, 0, state[0])
-    store_be64(destination, 8, state[1])
+    store_be64(destination, 0, bit_reverse(state[0]))
+    store_be64(destination, 8, bit_reverse(state[1]))
 
 
 def increment32(counter: BPtr):
@@ -1230,20 +1280,44 @@ def aes_gcm_prepare(
     return rounds
 
 
-def aes_gcm_xor(
+def aes_gcm_xor_range(
     source: UnsafePointer[UInt8, _],
     destination: BPtr,
     n: Int,
     expanded: BPtr,
     rounds: Int,
     j0: UnsafePointer[UInt8, _],
+    first_block: Int,
 ):
     var counter = InlineArray[UInt8, 16](fill=0)
     var stream = InlineArray[UInt8, 16](fill=0)
+    var counters = InlineArray[UInt8, 64](fill=0)
+    var streams = InlineArray[UInt8, 64](fill=0)
     var counter_ptr = BPtr(unsafe_from_address=Int(counter.unsafe_ptr()))
     var stream_ptr = BPtr(unsafe_from_address=Int(stream.unsafe_ptr()))
+    var counters_ptr = BPtr(unsafe_from_address=Int(counters.unsafe_ptr()))
+    var streams_ptr = BPtr(unsafe_from_address=Int(streams.unsafe_ptr()))
     copy_bytes(counter.unsafe_ptr(), j0, 16)
+    store_be32(
+        counter.unsafe_ptr(),
+        12,
+        load_be32(j0, 12) + UInt32(first_block),
+    )
     var offset = 0
+    while offset + 64 <= n:
+        comptime for lane in range(4):
+            increment32(counter_ptr)
+            copy_bytes(counters_ptr + lane * 16, counter.unsafe_ptr(), 16)
+        aes_encrypt_four_blocks(
+            counters.unsafe_ptr(), streams_ptr, expanded, rounds
+        )
+        xor_bytes(
+            destination + offset,
+            source + offset,
+            streams.unsafe_ptr(),
+            64,
+        )
+        offset += 64
     while offset < n:
         increment32(counter_ptr)
         aes_encrypt_block(counter.unsafe_ptr(), stream_ptr, expanded, rounds)
@@ -1252,6 +1326,61 @@ def aes_gcm_xor(
             count = n - offset
         xor_bytes(destination + offset, source + offset, stream.unsafe_ptr(), count)
         offset += count
+
+
+def aes_gcm_xor(
+    source: UnsafePointer[UInt8, _],
+    destination: BPtr,
+    n: Int,
+    expanded: BPtr,
+    rounds: Int,
+    j0: UnsafePointer[UInt8, _],
+):
+    comptime PARALLEL_THRESHOLD = 262_144
+    comptime BLOCKS_PER_TASK = 1_024
+    var full_blocks = n // 16
+    if n >= PARALLEL_THRESHOLD:
+        var task_count = (
+            full_blocks + BLOCKS_PER_TASK - 1
+        ) // BLOCKS_PER_TASK
+        var source_address = Int(source)
+        var destination_address = Int(destination)
+        var expanded_address = Int(expanded)
+        var j0_address = Int(j0)
+
+        @parameter
+        def work(task: Int):
+            var first_block = task * BLOCKS_PER_TASK
+            var count = BLOCKS_PER_TASK
+            if count > full_blocks - first_block:
+                count = full_blocks - first_block
+            aes_gcm_xor_range(
+                BPtr(unsafe_from_address=source_address) + first_block * 16,
+                BPtr(unsafe_from_address=destination_address) + first_block * 16,
+                count * 16,
+                BPtr(unsafe_from_address=expanded_address),
+                rounds,
+                BPtr(unsafe_from_address=j0_address),
+                first_block,
+            )
+
+        parallelize[work](task_count, 16)
+    else:
+        aes_gcm_xor_range(
+            source, destination, full_blocks * 16,
+            expanded, rounds, j0, 0,
+        )
+    var offset = full_blocks * 16
+    if offset < n:
+        aes_gcm_xor_range(
+            source + offset,
+            destination + offset,
+            n - offset,
+            expanded,
+            rounds,
+            j0,
+            full_blocks,
+        )
 
 
 @export("mc_aesgcm_encrypt")
@@ -1362,12 +1491,9 @@ def mc_aesgcm_decrypt(
 
 @always_inline
 def load_le32(data: UnsafePointer[UInt8, _], i: Int) -> UInt32:
-    return (
-        UInt32(data[i])
-        | (UInt32(data[i + 1]) << 8)
-        | (UInt32(data[i + 2]) << 16)
-        | (UInt32(data[i + 3]) << 24)
-    )
+    return (data + i).bitcast[UInt32]().load[
+        width=1, alignment=1
+    ]()[0]
 
 
 @always_inline
@@ -1386,6 +1512,13 @@ def store_le64[dst_origin: MutOrigin](
 ):
     for j in range(8):
         dst[i + j] = UInt8(x >> UInt64(j * 8))
+
+
+@always_inline
+def load_le64(data: UnsafePointer[UInt8, _], i: Int) -> UInt64:
+    return (data + i).bitcast[UInt64]().load[
+        width=1, alignment=1
+    ]()[0]
 
 
 @always_inline
@@ -1426,7 +1559,7 @@ def chacha_block(
     for i in range(16):
         working[i] = initial[i]
     var words = U32Ptr(unsafe_from_address=Int(working.unsafe_ptr()))
-    for _ in range(10):
+    comptime for _ in range(10):
         chacha_quarter(words, 0, 4, 8, 12)
         chacha_quarter(words, 1, 5, 9, 13)
         chacha_quarter(words, 2, 6, 10, 14)
@@ -1437,6 +1570,108 @@ def chacha_block(
         chacha_quarter(words, 3, 4, 9, 14)
     for i in range(16):
         store_le32(destination, i * 4, working[i] + initial[i])
+
+
+@always_inline
+def chacha_quarter_simd(
+    mut a: SIMD[DType.uint32, simd_width_of[DType.float64]()],
+    mut b: SIMD[DType.uint32, simd_width_of[DType.float64]()],
+    mut c: SIMD[DType.uint32, simd_width_of[DType.float64]()],
+    mut d: SIMD[DType.uint32, simd_width_of[DType.float64]()],
+):
+    a += b
+    d = ((d ^ a) << 16) | ((d ^ a) >> 16)
+    c += d
+    b = ((b ^ c) << 12) | ((b ^ c) >> 20)
+    a += b
+    d = ((d ^ a) << 8) | ((d ^ a) >> 24)
+    c += d
+    b = ((b ^ c) << 7) | ((b ^ c) >> 25)
+
+
+@always_inline
+def chacha_xor_simd_word(
+    source: UnsafePointer[UInt8, _],
+    destination: BPtr,
+    first_block: Int,
+    word_index: Int,
+    value: SIMD[DType.uint32, simd_width_of[DType.float64]()],
+):
+    comptime W = simd_width_of[DType.float64]()
+    comptime for lane in range(W):
+        var offset = (first_block + lane) * 64 + word_index * 4
+        store_le32(
+            destination,
+            offset,
+            load_le32(source, offset) ^ value[lane],
+        )
+
+
+def chacha_xor_simd_blocks(
+    key: UnsafePointer[UInt8, _],
+    nonce: UnsafePointer[UInt8, _],
+    source: UnsafePointer[UInt8, _],
+    destination: BPtr,
+    first_block: Int,
+):
+    comptime W = simd_width_of[DType.float64]()
+    var i0 = SIMD[DType.uint32, W](0x61707865)
+    var i1 = SIMD[DType.uint32, W](0x3320646E)
+    var i2 = SIMD[DType.uint32, W](0x79622D32)
+    var i3 = SIMD[DType.uint32, W](0x6B206574)
+    var i4 = SIMD[DType.uint32, W](load_le32(key, 0))
+    var i5 = SIMD[DType.uint32, W](load_le32(key, 4))
+    var i6 = SIMD[DType.uint32, W](load_le32(key, 8))
+    var i7 = SIMD[DType.uint32, W](load_le32(key, 12))
+    var i8 = SIMD[DType.uint32, W](load_le32(key, 16))
+    var i9 = SIMD[DType.uint32, W](load_le32(key, 20))
+    var i10 = SIMD[DType.uint32, W](load_le32(key, 24))
+    var i11 = SIMD[DType.uint32, W](load_le32(key, 28))
+    var i12 = iota[DType.uint32, W](UInt32(first_block + 1))
+    var i13 = SIMD[DType.uint32, W](load_le32(nonce, 0))
+    var i14 = SIMD[DType.uint32, W](load_le32(nonce, 4))
+    var i15 = SIMD[DType.uint32, W](load_le32(nonce, 8))
+    var s0 = i0
+    var s1 = i1
+    var s2 = i2
+    var s3 = i3
+    var s4 = i4
+    var s5 = i5
+    var s6 = i6
+    var s7 = i7
+    var s8 = i8
+    var s9 = i9
+    var s10 = i10
+    var s11 = i11
+    var s12 = i12
+    var s13 = i13
+    var s14 = i14
+    var s15 = i15
+    comptime for _ in range(10):
+        chacha_quarter_simd(s0, s4, s8, s12)
+        chacha_quarter_simd(s1, s5, s9, s13)
+        chacha_quarter_simd(s2, s6, s10, s14)
+        chacha_quarter_simd(s3, s7, s11, s15)
+        chacha_quarter_simd(s0, s5, s10, s15)
+        chacha_quarter_simd(s1, s6, s11, s12)
+        chacha_quarter_simd(s2, s7, s8, s13)
+        chacha_quarter_simd(s3, s4, s9, s14)
+    chacha_xor_simd_word(source, destination, first_block, 0, s0 + i0)
+    chacha_xor_simd_word(source, destination, first_block, 1, s1 + i1)
+    chacha_xor_simd_word(source, destination, first_block, 2, s2 + i2)
+    chacha_xor_simd_word(source, destination, first_block, 3, s3 + i3)
+    chacha_xor_simd_word(source, destination, first_block, 4, s4 + i4)
+    chacha_xor_simd_word(source, destination, first_block, 5, s5 + i5)
+    chacha_xor_simd_word(source, destination, first_block, 6, s6 + i6)
+    chacha_xor_simd_word(source, destination, first_block, 7, s7 + i7)
+    chacha_xor_simd_word(source, destination, first_block, 8, s8 + i8)
+    chacha_xor_simd_word(source, destination, first_block, 9, s9 + i9)
+    chacha_xor_simd_word(source, destination, first_block, 10, s10 + i10)
+    chacha_xor_simd_word(source, destination, first_block, 11, s11 + i11)
+    chacha_xor_simd_word(source, destination, first_block, 12, s12 + i12)
+    chacha_xor_simd_word(source, destination, first_block, 13, s13 + i13)
+    chacha_xor_simd_word(source, destination, first_block, 14, s14 + i14)
+    chacha_xor_simd_word(source, destination, first_block, 15, s15 + i15)
 
 
 def chacha_xor_blocks(
@@ -1450,6 +1685,12 @@ def chacha_xor_blocks(
     var stream = InlineArray[UInt8, 64](fill=0)
     var stream_ptr = BPtr(unsafe_from_address=Int(stream.unsafe_ptr()))
     var block = first_block
+    comptime W = simd_width_of[DType.float64]()
+    while block + W <= first_block + block_count:
+        chacha_xor_simd_blocks(
+            key, nonce, source, destination, block
+        )
+        block += W
     while block < first_block + block_count:
         chacha_block(key, nonce, UInt32(block + 1), stream_ptr)
         var offset = block * 64
@@ -1518,40 +1759,113 @@ def chacha_xor(
         )
 
 
+def chacha_xor_gpu_kernel(
+    key: BPtr,
+    nonce: BPtr,
+    source: BPtr,
+    destination: BPtr,
+    n: Int,
+):
+    var block = Int(global_idx.x)
+    var offset = block * 64
+    if offset >= n:
+        return
+    var stream = InlineArray[UInt8, 64](fill=0)
+    chacha_block(
+        key,
+        nonce,
+        UInt32(block + 1),
+        BPtr(unsafe_from_address=Int(stream.unsafe_ptr())),
+    )
+    var count = 64
+    if count > n - offset:
+        count = n - offset
+    for i in range(count):
+        destination[offset + i] = source[offset + i] ^ stream[i]
+
+
+def chacha_xor_gpu(
+    key: BPtr,
+    nonce: BPtr,
+    source: BPtr,
+    destination: BPtr,
+    n: Int,
+) -> Bool:
+    comptime GPU_THRESHOLD = 1_048_576
+    comptime MAX_GPU_INPUT = (2 * 1024 * 1024 * 1024 - 44) // 2
+    if n < GPU_THRESHOLD or n > MAX_GPU_INPUT:
+        return False
+    try:
+        var ctx = DeviceContext()
+        var device_key = ctx.enqueue_create_buffer[DType.uint8](32)
+        var device_nonce = ctx.enqueue_create_buffer[DType.uint8](12)
+        var device_source = ctx.enqueue_create_buffer[DType.uint8](n)
+        var device_destination = ctx.enqueue_create_buffer[DType.uint8](n)
+        ctx.enqueue_copy(device_key, key)
+        ctx.enqueue_copy(device_nonce, nonce)
+        ctx.enqueue_copy(device_source, source)
+        comptime BLOCK_SIZE = 128
+        var blocks = (n + 63) // 64
+        ctx.enqueue_function[chacha_xor_gpu_kernel](
+            device_key,
+            device_nonce,
+            device_source,
+            device_destination,
+            n,
+            grid_dim=(blocks + BLOCK_SIZE - 1) // BLOCK_SIZE,
+            block_dim=BLOCK_SIZE,
+        )
+        ctx.enqueue_copy(destination, device_destination)
+        ctx.synchronize()
+        return True
+    except:
+        return False
+
+
+@export("mc_gpu_available")
+def mc_gpu_available() abi("C") -> Int:
+    try:
+        var ctx = DeviceContext()
+        _ = ctx.name()
+        return 1
+    except:
+        return 0
+
+
 def poly1305_block(
     h: U64Ptr, r: U64Ptr, data: UnsafePointer[UInt8, _]
 ):
-    var t0 = UInt64(load_le32(data, 0))
-    var t1 = UInt64(load_le32(data, 4))
-    var t2 = UInt64(load_le32(data, 8))
-    var t3 = UInt64(load_le32(data, 12))
-    h[0] += t0 & 0x3FFFFFF
-    h[1] += ((t0 >> 26) | (t1 << 6)) & 0x3FFFFFF
-    h[2] += ((t1 >> 20) | (t2 << 12)) & 0x3FFFFFF
-    h[3] += ((t2 >> 14) | (t3 << 18)) & 0x3FFFFFF
-    h[4] += (t3 >> 8) | 0x1000000
-    var d0 = h[0] * r[0] + h[1] * r[9] + h[2] * r[8] + h[3] * r[7] + h[4] * r[6]
-    var d1 = h[0] * r[1] + h[1] * r[0] + h[2] * r[9] + h[3] * r[8] + h[4] * r[7]
-    var d2 = h[0] * r[2] + h[1] * r[1] + h[2] * r[0] + h[3] * r[9] + h[4] * r[8]
-    var d3 = h[0] * r[3] + h[1] * r[2] + h[2] * r[1] + h[3] * r[0] + h[4] * r[9]
-    var d4 = h[0] * r[4] + h[1] * r[3] + h[2] * r[2] + h[3] * r[1] + h[4] * r[0]
-    var carry = d0 >> 26
-    h[0] = d0 & 0x3FFFFFF
-    d1 += carry
-    carry = d1 >> 26
-    h[1] = d1 & 0x3FFFFFF
-    d2 += carry
-    carry = d2 >> 26
-    h[2] = d2 & 0x3FFFFFF
-    d3 += carry
-    carry = d3 >> 26
-    h[3] = d3 & 0x3FFFFFF
-    d4 += carry
-    carry = d4 >> 26
-    h[4] = d4 & 0x3FFFFFF
+    var t0 = load_le64(data, 0)
+    var t1 = load_le64(data, 8)
+    h[0] += t0 & 0xFFFFFFFFFFF
+    h[1] += ((t0 >> 44) | (t1 << 20)) & 0xFFFFFFFFFFF
+    h[2] += (t1 >> 24) | 0x10000000000
+    var d0 = (
+        UInt128(h[0]) * UInt128(r[0])
+        + UInt128(h[1]) * UInt128(r[4])
+        + UInt128(h[2]) * UInt128(r[3])
+    )
+    var d1 = (
+        UInt128(h[0]) * UInt128(r[1])
+        + UInt128(h[1]) * UInt128(r[0])
+        + UInt128(h[2]) * UInt128(r[4])
+    )
+    var d2 = (
+        UInt128(h[0]) * UInt128(r[2])
+        + UInt128(h[1]) * UInt128(r[1])
+        + UInt128(h[2]) * UInt128(r[0])
+    )
+    var carry = UInt64(d0 >> 44)
+    h[0] = UInt64(d0) & 0xFFFFFFFFFFF
+    d1 += UInt128(carry)
+    carry = UInt64(d1 >> 44)
+    h[1] = UInt64(d1) & 0xFFFFFFFFFFF
+    d2 += UInt128(carry)
+    carry = UInt64(d2 >> 42)
+    h[2] = UInt64(d2) & 0x3FFFFFFFFFF
     h[0] += carry * 5
-    carry = h[0] >> 26
-    h[0] &= 0x3FFFFFF
+    carry = h[0] >> 44
+    h[0] &= 0xFFFFFFFFFFF
     h[1] += carry
 
 
@@ -1577,73 +1891,54 @@ def poly1305_auth(
     data_len: Int,
     destination: BPtr,
 ):
-    var r = InlineArray[UInt64, 10](fill=0)
-    var h = InlineArray[UInt64, 5](fill=0)
+    var r = InlineArray[UInt64, 5](fill=0)
+    var h = InlineArray[UInt64, 3](fill=0)
     var r_ptr = U64Ptr(unsafe_from_address=Int(r.unsafe_ptr()))
     var h_ptr = U64Ptr(unsafe_from_address=Int(h.unsafe_ptr()))
-    var t0 = UInt64(load_le32(one_time_key, 0))
-    var t1 = UInt64(load_le32(one_time_key, 4))
-    var t2 = UInt64(load_le32(one_time_key, 8))
-    var t3 = UInt64(load_le32(one_time_key, 12))
-    r[0] = t0 & 0x3FFFFFF
-    r[1] = ((t0 >> 26) | (t1 << 6)) & 0x3FFFF03
-    r[2] = ((t1 >> 20) | (t2 << 12)) & 0x3FFC0FF
-    r[3] = ((t2 >> 14) | (t3 << 18)) & 0x3F03FFF
-    r[4] = (t3 >> 8) & 0x00FFFFF
-    r[5] = r[0] * 5
-    r[6] = r[1] * 5
-    r[7] = r[2] * 5
-    r[8] = r[3] * 5
-    r[9] = r[4] * 5
+    var t0 = load_le64(one_time_key, 0)
+    var t1 = load_le64(one_time_key, 8)
+    r[0] = t0 & 0xFFC0FFFFFFF
+    r[1] = ((t0 >> 44) | (t1 << 20)) & 0xFFFFFC0FFFF
+    r[2] = (t1 >> 24) & 0x00FFFFFFC0F
+    r[3] = r[1] * 20
+    r[4] = r[2] * 20
     poly1305_update(h_ptr, r_ptr, aad, aad_len)
     poly1305_update(h_ptr, r_ptr, data, data_len)
     var lengths = InlineArray[UInt8, 16](fill=0)
     store_le64(lengths.unsafe_ptr(), 0, UInt64(aad_len))
     store_le64(lengths.unsafe_ptr(), 8, UInt64(data_len))
     poly1305_block(h_ptr, r_ptr, lengths.unsafe_ptr())
-    var carry = h[1] >> 26
-    h[1] &= 0x3FFFFFF
+    var carry = h[1] >> 44
+    h[1] &= 0xFFFFFFFFFFF
     h[2] += carry
-    carry = h[2] >> 26
-    h[2] &= 0x3FFFFFF
-    h[3] += carry
-    carry = h[3] >> 26
-    h[3] &= 0x3FFFFFF
-    h[4] += carry
-    carry = h[4] >> 26
-    h[4] &= 0x3FFFFFF
+    carry = h[2] >> 42
+    h[2] &= 0x3FFFFFFFFFF
     h[0] += carry * 5
-    carry = h[0] >> 26
-    h[0] &= 0x3FFFFFF
+    carry = h[0] >> 44
+    h[0] &= 0xFFFFFFFFFFF
     h[1] += carry
     var g0 = h[0] + 5
-    carry = g0 >> 26
-    g0 &= 0x3FFFFFF
+    carry = g0 >> 44
+    g0 &= 0xFFFFFFFFFFF
     var g1 = h[1] + carry
-    carry = g1 >> 26
-    g1 &= 0x3FFFFFF
-    var g2 = h[2] + carry
-    carry = g2 >> 26
-    g2 &= 0x3FFFFFF
-    var g3 = h[3] + carry
-    carry = g3 >> 26
-    g3 &= 0x3FFFFFF
-    var g4 = h[4] + carry - 0x4000000
-    var mask = (g4 >> 63) - 1
+    carry = g1 >> 44
+    g1 &= 0xFFFFFFFFFFF
+    var g2 = h[2] + carry - 0x40000000000
+    var mask = (g2 >> 63) - 1
     var inverse = ~mask
     h[0] = (h[0] & inverse) | (g0 & mask)
     h[1] = (h[1] & inverse) | (g1 & mask)
     h[2] = (h[2] & inverse) | (g2 & mask)
-    h[3] = (h[3] & inverse) | (g3 & mask)
-    h[4] = (h[4] & inverse) | (g4 & mask)
-    var f0 = ((h[0] | (h[1] << 26)) & 0xFFFFFFFF) + UInt64(load_le32(one_time_key, 16))
-    var f1 = (((h[1] >> 6) | (h[2] << 20)) & 0xFFFFFFFF) + UInt64(load_le32(one_time_key, 20)) + (f0 >> 32)
-    var f2 = (((h[2] >> 12) | (h[3] << 14)) & 0xFFFFFFFF) + UInt64(load_le32(one_time_key, 24)) + (f1 >> 32)
-    var f3 = (((h[3] >> 18) | (h[4] << 8)) & 0xFFFFFFFF) + UInt64(load_le32(one_time_key, 28)) + (f2 >> 32)
-    store_le32(destination, 0, UInt32(f0))
-    store_le32(destination, 4, UInt32(f1))
-    store_le32(destination, 8, UInt32(f2))
-    store_le32(destination, 12, UInt32(f3))
+    var low = h[0] | (h[1] << 44)
+    var high = (h[1] >> 20) | (h[2] << 24)
+    var f0 = UInt128(low) + UInt128(load_le64(one_time_key, 16))
+    var f1 = (
+        UInt128(high)
+        + UInt128(load_le64(one_time_key, 24))
+        + (f0 >> 64)
+    )
+    store_le64(destination, 0, UInt64(f0))
+    store_le64(destination, 8, UInt64(f1))
 
 
 @export("mc_chacha20poly1305_encrypt")
@@ -1655,6 +1950,7 @@ def mc_chacha20poly1305_encrypt(
     aad_addr: Int,
     aad_len: Int,
     dst_addr: Int,
+    use_gpu: Int,
 ) abi("C") -> Int:
     if (
         key_addr == 0 or nonce_addr == 0 or data_addr == 0
@@ -1671,7 +1967,10 @@ def mc_chacha20poly1305_encrypt(
     chacha_block(
         key, nonce, 0, BPtr(unsafe_from_address=Int(first_block.unsafe_ptr()))
     )
-    chacha_xor(key, nonce, data, dst, data_len)
+    if use_gpu == 0 or not chacha_xor_gpu(
+        key, nonce, data, dst, data_len
+    ):
+        chacha_xor(key, nonce, data, dst, data_len)
     poly1305_auth(
         first_block.unsafe_ptr(), aad, aad_len, dst, data_len, dst + data_len
     )
@@ -1687,6 +1986,7 @@ def mc_chacha20poly1305_decrypt(
     aad_addr: Int,
     aad_len: Int,
     dst_addr: Int,
+    use_gpu: Int,
 ) abi("C") -> Int:
     if (
         key_addr == 0 or nonce_addr == 0 or data_addr == 0
@@ -1714,7 +2014,10 @@ def mc_chacha20poly1305_decrypt(
         difference |= expected[i] ^ data[plain_len + i]
     if difference != 0:
         return 0
-    chacha_xor(key, nonce, data, dst, plain_len)
+    if use_gpu == 0 or not chacha_xor_gpu(
+        key, nonce, data, dst, plain_len
+    ):
+        chacha_xor(key, nonce, data, dst, plain_len)
     return 1
 
 

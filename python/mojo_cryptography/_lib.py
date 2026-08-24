@@ -11,13 +11,14 @@ LIB = os.environ.get("MOJO_CRYPTOGRAPHY_LIB") or os.path.join(
 
 I = ctypes.c_int64
 _SIGNATURES = {
+    "mc_gpu_available": ([], I),
     "mc_digest": ([I, I, I, I], I),
     "mc_pbkdf2": ([I, I, I, I, I, I, I, I], I),
     "mc_hkdf": ([I, I, I, I, I, I, I, I, I], I),
     "mc_aesgcm_encrypt": ([I] * 9, I),
     "mc_aesgcm_decrypt": ([I] * 9, I),
-    "mc_chacha20poly1305_encrypt": ([I] * 7, I),
-    "mc_chacha20poly1305_decrypt": ([I] * 7, I),
+    "mc_chacha20poly1305_encrypt": ([I] * 8, I),
+    "mc_chacha20poly1305_decrypt": ([I] * 8, I),
 }
 
 _loaded: ctypes.CDLL | None = None
@@ -90,6 +91,10 @@ def output_buffer(length: int):
         raise ValueError("output length must be non-negative")
     buffer = _PyBytes_FromStringAndSize(None, length)
     return buffer, _PyBytes_AsString(buffer)
+
+
+def gpu_available() -> bool:
+    return bool(lib().mc_gpu_available())
 
 
 def digest(algorithm: int, data: bytes | bytearray) -> bytes:
@@ -192,6 +197,7 @@ def chacha20poly1305(
     nonce: bytes,
     data: bytes,
     associated_data: bytes,
+    use_gpu: bool = False,
 ) -> bytes | None:
     key_buf, key_addr, _ = input_buffer(key)
     nonce_buf, nonce_addr, _ = input_buffer(nonce)
@@ -214,6 +220,7 @@ def chacha20poly1305(
         aad_addr,
         aad_len,
         result_addr,
+        int(use_gpu),
     )
     del key_buf, nonce_buf, data_buf, aad_buf
     return result if ok else None

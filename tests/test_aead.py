@@ -105,6 +105,37 @@ def test_chacha20poly1305_parallel_threshold(data_len):
     assert ChaCha20Poly1305(key).decrypt(nonce, encrypted, aad) == data
 
 
+@pytest.mark.parametrize("data_len", [262_143, 262_144, 262_157])
+def test_aesgcm_parallel_threshold(data_len):
+    key = bytes(range(32))
+    nonce = bytes(range(12))
+    data = bytes((i * 11 + 5) & 255 for i in range(data_len))
+    aad = b"parallel threshold"
+    encrypted = AESGCM(key).encrypt(nonce, data, aad)
+    assert encrypted == UpstreamAESGCM(key).encrypt(nonce, data, aad)
+    assert AESGCM(key).decrypt(nonce, encrypted, aad) == data
+
+
+def test_chacha20poly1305_gpu_path_or_cpu_fallback():
+    key = bytes(range(32))
+    nonce = bytes(range(12))
+    data = bytes((i * 19 + 3) & 255 for i in range(1_048_589))
+    aad = b"optional GPU path"
+    cipher = ChaCha20Poly1305(key)
+    encrypted = cipher.encrypt(nonce, data, aad, device="gpu")
+    assert encrypted == UpstreamChaCha20Poly1305(key).encrypt(
+        nonce, data, aad
+    )
+    assert cipher.decrypt(nonce, encrypted, aad, device="gpu") == data
+
+
+def test_chacha20poly1305_rejects_unknown_device():
+    with pytest.raises(ValueError, match="device"):
+        ChaCha20Poly1305(bytes(range(32))).encrypt(
+            bytes(range(12)), b"", None, device="accelerator"
+        )
+
+
 def test_numpy_buffers_cross_ffi_zero_copy():
     key = bytes(range(32))
     nonce = bytes(range(12))

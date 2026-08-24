@@ -81,7 +81,11 @@ class ChaCha20Poly1305:
         return os.urandom(32)
 
     def encrypt(
-        self, nonce: bytes, data: bytes, associated_data: bytes | None
+        self,
+        nonce: bytes,
+        data: bytes,
+        associated_data: bytes | None,
+        device: str = "cpu",
     ) -> bytes:
         nonce = bytes(nonce)
         if len(nonce) != 12:
@@ -90,13 +94,21 @@ class ChaCha20Poly1305:
         aad = b"" if associated_data is None else _buffer(associated_data)
         _check_size(data, "data")
         _check_size(aad, "associated_data")
-        result = chacha20poly1305(False, self._key, nonce, data, aad)
+        if device not in ("cpu", "gpu"):
+            raise ValueError("device must be 'cpu' or 'gpu'")
+        result = chacha20poly1305(
+            False, self._key, nonce, data, aad, device == "gpu"
+        )
         if result is None:
             raise ValueError("ChaCha20-Poly1305 encryption failed")
         return result
 
     def decrypt(
-        self, nonce: bytes, data: bytes, associated_data: bytes | None
+        self,
+        nonce: bytes,
+        data: bytes,
+        associated_data: bytes | None,
+        device: str = "cpu",
     ) -> bytes:
         nonce = bytes(nonce)
         if len(nonce) != 12:
@@ -107,7 +119,11 @@ class ChaCha20Poly1305:
             raise InvalidTag
         aad = b"" if associated_data is None else _buffer(associated_data)
         _check_size(aad, "associated_data")
-        result = chacha20poly1305(True, self._key, nonce, data, aad)
+        if device not in ("cpu", "gpu"):
+            raise ValueError("device must be 'cpu' or 'gpu'")
+        result = chacha20poly1305(
+            True, self._key, nonce, data, aad, device == "gpu"
+        )
         if result is None:
             raise InvalidTag
         return result

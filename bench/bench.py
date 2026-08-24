@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import platform
+import subprocess
 import sys
 import time
 
@@ -30,6 +31,7 @@ from mojo_cryptography.hazmat.primitives.ciphers.aead import (
 )
 from mojo_cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from mojo_cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from mojo_cryptography._lib import gpu_available
 
 
 def best_time(function, repeat: int = 3) -> float:
@@ -62,6 +64,22 @@ def cpu_name() -> str:
     except OSError:
         pass
     return platform.processor() or "unknown CPU"
+
+
+def gpu_memory_free_mib() -> int:
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=5,
+        )
+        return max(int(line.strip()) for line in output.splitlines())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
 
 
 def main() -> None:
@@ -115,6 +133,24 @@ def main() -> None:
             lambda: chacha_reference.encrypt(nonce, data, aad),
         ),
     ]
+
+    free_gpu_mib = gpu_memory_free_mib()
+    if free_gpu_mib >= 4_000 and gpu_available():
+        cases.append(
+            (
+                "ChaCha20-Poly1305 GPU encrypt, 4 MiB",
+                lambda: chacha_ours.encrypt(
+                    nonce, data, aad, device="gpu"
+                ),
+                lambda: chacha_reference.encrypt(nonce, data, aad),
+            )
+        )
+    elif free_gpu_mib < 4_000:
+        print(
+            "GPU benchmark skipped: less than 4000 MiB device memory is free."
+        )
+    else:
+        print("GPU benchmark skipped: no usable accelerator context.")
 
     print(f"Machine: {cpu_name()} ({platform.system()} {platform.machine()})")
     print()
